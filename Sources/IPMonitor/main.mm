@@ -33,7 +33,9 @@ bool LooksLikeIPAddress(const std::string &value) {
 
 }  // namespace ipmonitor
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate> {
+    ipmonitor::MonitorState _monitorState;
+}
 
 @property (nonatomic, strong) NSStatusItem *statusItem;
 @property (nonatomic, strong) NSMenu *menu;
@@ -44,7 +46,6 @@ bool LooksLikeIPAddress(const std::string &value) {
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) NSDate *lastCheckedAt;
 @property (nonatomic, assign) BOOL notificationsAuthorized;
-@property (nonatomic, assign) ipmonitor::MonitorState monitorState;
 
 @end
 
@@ -57,7 +58,7 @@ bool LooksLikeIPAddress(const std::string &value) {
 
     NSString *storedIP = [[NSUserDefaults standardUserDefaults] stringForKey:ipmonitor::kLastKnownIPKey];
     if (storedIP != nil) {
-        self.monitorState.currentIP = ipmonitor::ToStdString(storedIP);
+        _monitorState.currentIP = ipmonitor::ToStdString(storedIP);
     }
 
     UNUserNotificationCenter *notificationCenter = [UNUserNotificationCenter currentNotificationCenter];
@@ -141,10 +142,11 @@ bool LooksLikeIPAddress(const std::string &value) {
             self.notificationsAuthorized = granted;
 
             if (error != nil) {
-                self.monitorState.lastError = ipmonitor::ToStdString(
+                _monitorState.lastError = ipmonitor::ToStdString(
                     [NSString stringWithFormat:@"Notification permission failed: %@",
                      error.localizedDescription]
                 );
+                NSLog(@"Notification permission failed: %@", error);
             }
 
             [self updateMenu];
@@ -171,11 +173,15 @@ bool LooksLikeIPAddress(const std::string &value) {
                                                        timeoutInterval:20.0];
     [request setValue:@"text/plain" forHTTPHeaderField:@"Accept"];
 
+    _monitorState.lastError = ipmonitor::ToStdString(@"Checking ip.me...");
+    [self updateMenu];
+
     [[[NSURLSession sharedSession] dataTaskWithRequest:request
                                      completionHandler:^(NSData * _Nullable data,
                                                          NSURLResponse * _Nullable response,
                                                          NSError * _Nullable error) {
         if (error != nil) {
+            NSLog(@"ip.me request failed: %@", error);
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self recordFailure:[NSString stringWithFormat:@"Request failed: %@",
                                      error.localizedDescription]];
@@ -186,6 +192,7 @@ bool LooksLikeIPAddress(const std::string &value) {
         if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
             NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
             if (httpResponse.statusCode < 200 || httpResponse.statusCode > 299) {
+                NSLog(@"ip.me returned HTTP status %ld", (long)httpResponse.statusCode);
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self recordFailure:[NSString stringWithFormat:@"Unexpected HTTP status: %ld",
                                          (long)httpResponse.statusCode]];
@@ -195,6 +202,7 @@ bool LooksLikeIPAddress(const std::string &value) {
         }
 
         if (data == nil) {
+            NSLog(@"ip.me returned an empty response body");
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self recordFailure:@"ip.me returned no response body"];
             });
@@ -202,11 +210,21 @@ bool LooksLikeIPAddress(const std::string &value) {
         }
 
         NSString *rawValue = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (rawValue == nil) {
+            NSLog(@"ip.me returned non-UTF8 data (%lu bytes)", (unsigned long)data.length);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self recordFailure:[NSString stringWithFormat:@"ip.me returned unreadable data (%lu bytes)",
+                                     (unsigned long)data.length]];
+            });
+            return;
+        }
+
         NSString *trimmedValue = [rawValue stringByTrimmingCharactersInSet:
                                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         std::string ipValue = ipmonitor::ToStdString(trimmedValue);
 
         if (!ipmonitor::LooksLikeIPAddress(ipValue)) {
+            NSLog(@"ip.me returned unexpected payload: %@", trimmedValue);
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self recordFailure:[NSString stringWithFormat:@"Unexpected response from ip.me: %@",
                                      trimmedValue]];
@@ -221,14 +239,16 @@ bool LooksLikeIPAddress(const std::string &value) {
 }
 
 - (void)recordSuccess:(const std::string &)ip notifyOnChange:(BOOL)notifyOnChange {
-    std::optional<std::string> previousIP = self.monitorState.currentIP;
+    std::optional<std::string> previousIP = _monitorState.currentIP;
 
-    self.monitorState.currentIP = ip;
-    self.monitorState.lastError.reset();
+    _monitorState.currentIP = ip;
+    _monitorState.lastError.reset();
     self.lastCheckedAt = [NSDate date];
 
     [[NSUserDefaults standardUserDefaults] setObject:ipmonitor::ToNSString(ip)
                                               forKey:ipmonitor::kLastKnownIPKey];
+
+    NSLog(@"Public IP updated to %@", ipmonitor::ToNSString(ip));
 
     if (previousIP.has_value() && previousIP.value() != ip && notifyOnChange) {
         [self sendNotificationFromIP:previousIP.value() toIP:ip];
@@ -238,17 +258,19 @@ bool LooksLikeIPAddress(const std::string &value) {
 }
 
 - (void)recordFailure:(NSString *)message {
-    self.monitorState.lastError = ipmonitor::ToStdString(message);
+    _monitorState.lastError = ipmonitor::ToStdString(message);
     self.lastCheckedAt = [NSDate date];
     [self updateMenu];
 }
 
 - (void)updateMenu {
-    if (self.monitorState.currentIP.has_value()) {
+    if (_monitorState.currentIP.has_value()) {
         self.currentIPMenuItem.title = [NSString stringWithFormat:@"Current IP: %@",
-                                        ipmonitor::ToNSString(self.monitorState.currentIP.value())];
+                                        ipmonitor::ToNSString(_monitorState.currentIP.value())];
     } else {
-        self.currentIPMenuItem.title = @"Current IP: Unknown";
+        self.currentIPMenuItem.title = _monitorState.lastError.has_value()
+            ? @"Current IP: Unavailable"
+            : @"Current IP: Unknown";
     }
 
     if (self.lastCheckedAt != nil) {
@@ -262,9 +284,9 @@ bool LooksLikeIPAddress(const std::string &value) {
         self.lastCheckedMenuItem.title = @"Last checked: Never";
     }
 
-    if (self.monitorState.lastError.has_value()) {
+    if (_monitorState.lastError.has_value()) {
         self.statusMenuItem.title = [NSString stringWithFormat:@"Status: %@",
-                                     ipmonitor::ToNSString(self.monitorState.lastError.value())];
+                                     ipmonitor::ToNSString(_monitorState.lastError.value())];
     } else {
         self.statusMenuItem.title = [NSString stringWithFormat:@"Status: Monitoring every %d seconds",
                                      (int)ipmonitor::kPollInterval];
@@ -273,6 +295,16 @@ bool LooksLikeIPAddress(const std::string &value) {
     self.notificationsMenuItem.title = self.notificationsAuthorized
         ? @"Notifications: Enabled"
         : @"Notifications: Not enabled";
+
+    if (self.statusItem.button != nil) {
+        NSString *tooltipIP = _monitorState.currentIP.has_value()
+            ? ipmonitor::ToNSString(_monitorState.currentIP.value())
+            : @"Unavailable";
+        NSString *tooltipStatus = _monitorState.lastError.has_value()
+            ? ipmonitor::ToNSString(_monitorState.lastError.value())
+            : @"Monitoring";
+        self.statusItem.button.toolTip = [NSString stringWithFormat:@"Public IP: %@\n%@", tooltipIP, tooltipStatus];
+    }
 }
 
 - (void)sendNotificationFromIP:(const std::string &)oldIP toIP:(const std::string &)newIP {

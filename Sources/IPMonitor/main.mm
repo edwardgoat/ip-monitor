@@ -31,6 +31,29 @@ bool LooksLikeIPAddress(const std::string &value) {
     return std::regex_match(value, kIPPattern);
 }
 
+NSArray<NSString *> *ResolverURLs() {
+    static NSArray<NSString *> *urls = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        urls = @[
+            @"https://api64.ipify.org",
+            @"https://ifconfig.me/ip"
+        ];
+    });
+    return urls;
+}
+
+NSString *TruncatedSingleLine(NSString *value, NSUInteger limit) {
+    NSString *flattened = [[value stringByReplacingOccurrencesOfString:@"\r" withString:@" "]
+        stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+
+    if (flattened.length <= limit) {
+        return flattened;
+    }
+
+    return [[flattened substringToIndex:limit] stringByAppendingString:@"..."];
+}
+
 }  // namespace ipmonitor
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate> {
@@ -166,25 +189,50 @@ bool LooksLikeIPAddress(const std::string &value) {
     [NSApp terminate:nil];
 }
 
-- (void)performCheck:(BOOL)notifyOnChange {
-    NSURL *url = [NSURL URLWithString:@"https://ip.me"];
+- (void)performCheckWithResolverIndex:(NSUInteger)resolverIndex
+                       notifyOnChange:(BOOL)notifyOnChange
+                      failureMessages:(NSMutableArray<NSString *> *)failureMessages {
+    NSArray<NSString *> *resolverURLs = ipmonitor::ResolverURLs();
+    if (resolverIndex >= resolverURLs.count) {
+        NSString *combinedFailure = failureMessages.count > 0
+            ? [failureMessages componentsJoinedByString:@" | "]
+            : @"No IP resolvers configured";
+        [self recordFailure:combinedFailure];
+        return;
+    }
+
+    NSString *resolverURLString = resolverURLs[resolverIndex];
+    NSURL *url = [NSURL URLWithString:resolverURLString];
+    if (url == nil) {
+        [failureMessages addObject:[NSString stringWithFormat:@"Invalid resolver URL: %@",
+                                    resolverURLString]];
+        [self performCheckWithResolverIndex:(resolverIndex + 1)
+                             notifyOnChange:notifyOnChange
+                            failureMessages:failureMessages];
+        return;
+    }
+
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url
                                                            cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                                        timeoutInterval:20.0];
     [request setValue:@"text/plain" forHTTPHeaderField:@"Accept"];
-
-    _monitorState.lastError = ipmonitor::ToStdString(@"Checking ip.me...");
-    [self updateMenu];
+    [request setValue:@"IPMonitor/1.0" forHTTPHeaderField:@"User-Agent"];
 
     [[[NSURLSession sharedSession] dataTaskWithRequest:request
                                      completionHandler:^(NSData * _Nullable data,
                                                          NSURLResponse * _Nullable response,
                                                          NSError * _Nullable error) {
+        NSString *resolverName = url.host ?: resolverURLString;
+
         if (error != nil) {
-            NSLog(@"ip.me request failed: %@", error);
+            NSLog(@"%@ request failed: %@", resolverName, error);
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self recordFailure:[NSString stringWithFormat:@"Request failed: %@",
-                                     error.localizedDescription]];
+                [failureMessages addObject:[NSString stringWithFormat:@"%@ request failed: %@",
+                                            resolverName,
+                                            error.localizedDescription]];
+                [self performCheckWithResolverIndex:(resolverIndex + 1)
+                                     notifyOnChange:notifyOnChange
+                                    failureMessages:failureMessages];
             });
             return;
         }
@@ -192,29 +240,40 @@ bool LooksLikeIPAddress(const std::string &value) {
         if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
             NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
             if (httpResponse.statusCode < 200 || httpResponse.statusCode > 299) {
-                NSLog(@"ip.me returned HTTP status %ld", (long)httpResponse.statusCode);
+                NSLog(@"%@ returned HTTP status %ld", resolverName, (long)httpResponse.statusCode);
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self recordFailure:[NSString stringWithFormat:@"Unexpected HTTP status: %ld",
-                                         (long)httpResponse.statusCode]];
+                    [failureMessages addObject:[NSString stringWithFormat:@"%@ returned HTTP %ld",
+                                                resolverName,
+                                                (long)httpResponse.statusCode]];
+                    [self performCheckWithResolverIndex:(resolverIndex + 1)
+                                         notifyOnChange:notifyOnChange
+                                        failureMessages:failureMessages];
                 });
                 return;
             }
         }
 
         if (data == nil) {
-            NSLog(@"ip.me returned an empty response body");
+            NSLog(@"%@ returned an empty response body", resolverName);
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self recordFailure:@"ip.me returned no response body"];
+                [failureMessages addObject:[NSString stringWithFormat:@"%@ returned no response body",
+                                            resolverName]];
+                [self performCheckWithResolverIndex:(resolverIndex + 1)
+                                     notifyOnChange:notifyOnChange
+                                    failureMessages:failureMessages];
             });
             return;
         }
 
         NSString *rawValue = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         if (rawValue == nil) {
-            NSLog(@"ip.me returned non-UTF8 data (%lu bytes)", (unsigned long)data.length);
+            NSLog(@"%@ returned non-UTF8 data (%lu bytes)", resolverName, (unsigned long)data.length);
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self recordFailure:[NSString stringWithFormat:@"ip.me returned unreadable data (%lu bytes)",
-                                     (unsigned long)data.length]];
+                [failureMessages addObject:[NSString stringWithFormat:@"%@ returned unreadable data",
+                                            resolverName]];
+                [self performCheckWithResolverIndex:(resolverIndex + 1)
+                                     notifyOnChange:notifyOnChange
+                                    failureMessages:failureMessages];
             });
             return;
         }
@@ -224,21 +283,38 @@ bool LooksLikeIPAddress(const std::string &value) {
         std::string ipValue = ipmonitor::ToStdString(trimmedValue);
 
         if (!ipmonitor::LooksLikeIPAddress(ipValue)) {
-            NSLog(@"ip.me returned unexpected payload: %@", trimmedValue);
+            NSString *shortPayload = ipmonitor::TruncatedSingleLine(trimmedValue, 100);
+            NSLog(@"%@ returned unexpected payload: %@", resolverName, shortPayload);
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self recordFailure:[NSString stringWithFormat:@"Unexpected response from ip.me: %@",
-                                     trimmedValue]];
+                [failureMessages addObject:[NSString stringWithFormat:@"%@ returned non-IP data: %@",
+                                            resolverName,
+                                            shortPayload]];
+                [self performCheckWithResolverIndex:(resolverIndex + 1)
+                                     notifyOnChange:notifyOnChange
+                                    failureMessages:failureMessages];
             });
             return;
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self recordSuccess:ipValue notifyOnChange:notifyOnChange];
+            [self recordSuccess:ipValue
+                 notifyOnChange:notifyOnChange
+                       resolver:resolverName];
         });
     }] resume];
 }
 
-- (void)recordSuccess:(const std::string &)ip notifyOnChange:(BOOL)notifyOnChange {
+- (void)performCheck:(BOOL)notifyOnChange {
+    _monitorState.lastError = ipmonitor::ToStdString(@"Checking public IP resolver...");
+    [self updateMenu];
+    [self performCheckWithResolverIndex:0
+                         notifyOnChange:notifyOnChange
+                        failureMessages:[NSMutableArray array]];
+}
+
+- (void)recordSuccess:(const std::string &)ip
+       notifyOnChange:(BOOL)notifyOnChange
+             resolver:(NSString *)resolverName {
     std::optional<std::string> previousIP = _monitorState.currentIP;
 
     _monitorState.currentIP = ip;
@@ -248,7 +324,7 @@ bool LooksLikeIPAddress(const std::string &value) {
     [[NSUserDefaults standardUserDefaults] setObject:ipmonitor::ToNSString(ip)
                                               forKey:ipmonitor::kLastKnownIPKey];
 
-    NSLog(@"Public IP updated to %@", ipmonitor::ToNSString(ip));
+    NSLog(@"Public IP updated to %@ via %@", ipmonitor::ToNSString(ip), resolverName);
 
     if (previousIP.has_value() && previousIP.value() != ip && notifyOnChange) {
         [self sendNotificationFromIP:previousIP.value() toIP:ip];

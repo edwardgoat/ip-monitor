@@ -1,6 +1,6 @@
 # IPMonitor
 
-`IPMonitor` is a lightweight macOS menu-bar app that checks your public IP address by calling `https://ip.me`. It runs without a Dock icon, remembers the last public IP it saw, and sends a local macOS notification when that IP changes.
+`IPMonitor` is a lightweight macOS menu-bar app written in Objective-C++ that checks your public IP address by calling `https://ip.me`. It runs without a Dock icon, remembers the last public IP it saw, and sends a local macOS notification when that IP changes.
 
 ## What it does
 
@@ -8,6 +8,7 @@
 - Stores the last known public IP in `UserDefaults`.
 - Sends a local notification when the public IP changes.
 - Runs as a menu-bar app so you can check the current status or quit it manually.
+- Uses C++ for the monitoring logic while keeping the macOS UI and notification integration native.
 
 ## Build
 

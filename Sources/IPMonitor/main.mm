@@ -1,8 +1,37 @@
 #import <Cocoa/Cocoa.h>
 #import <UserNotifications/UserNotifications.h>
 
+#include <optional>
+#include <regex>
+#include <string>
+
+namespace ipmonitor {
+
 static NSString * const kLastKnownIPKey = @"LastKnownPublicIP";
-static NSTimeInterval const kPollInterval = 300.0;
+constexpr NSTimeInterval kPollInterval = 300.0;
+
+struct MonitorState {
+    std::optional<std::string> currentIP;
+    std::optional<std::string> lastError;
+};
+
+std::string ToStdString(NSString *value) {
+    return value == nil ? std::string() : std::string(value.UTF8String);
+}
+
+NSString *ToNSString(const std::string &value) {
+    return [NSString stringWithUTF8String:value.c_str()];
+}
+
+bool LooksLikeIPAddress(const std::string &value) {
+    static const std::regex kIPPattern(
+        R"(^([0-9]{1,3}(\.[0-9]{1,3}){3}|[0-9A-Fa-f:]+)$)"
+    );
+
+    return std::regex_match(value, kIPPattern);
+}
+
+}  // namespace ipmonitor
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate>
 
@@ -13,10 +42,9 @@ static NSTimeInterval const kPollInterval = 300.0;
 @property (nonatomic, strong) NSMenuItem *statusMenuItem;
 @property (nonatomic, strong) NSMenuItem *notificationsMenuItem;
 @property (nonatomic, strong) NSTimer *timer;
-@property (nonatomic, copy) NSString *currentIP;
 @property (nonatomic, strong) NSDate *lastCheckedAt;
-@property (nonatomic, copy) NSString *lastError;
 @property (nonatomic, assign) BOOL notificationsAuthorized;
+@property (nonatomic, assign) ipmonitor::MonitorState monitorState;
 
 @end
 
@@ -27,7 +55,10 @@ static NSTimeInterval const kPollInterval = 300.0;
 
     [self configureMenu];
 
-    self.currentIP = [[NSUserDefaults standardUserDefaults] stringForKey:kLastKnownIPKey];
+    NSString *storedIP = [[NSUserDefaults standardUserDefaults] stringForKey:ipmonitor::kLastKnownIPKey];
+    if (storedIP != nil) {
+        self.monitorState.currentIP = ipmonitor::ToStdString(storedIP);
+    }
 
     UNUserNotificationCenter *notificationCenter = [UNUserNotificationCenter currentNotificationCenter];
     notificationCenter.delegate = self;
@@ -36,7 +67,7 @@ static NSTimeInterval const kPollInterval = 300.0;
     [self updateMenu];
     [self performCheck:NO];
 
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:kPollInterval
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:ipmonitor::kPollInterval
                                                   target:self
                                                 selector:@selector(timerFired:)
                                                 userInfo:nil
@@ -110,8 +141,10 @@ static NSTimeInterval const kPollInterval = 300.0;
             self.notificationsAuthorized = granted;
 
             if (error != nil) {
-                self.lastError = [NSString stringWithFormat:@"Notification permission failed: %@",
-                                  error.localizedDescription];
+                self.monitorState.lastError = ipmonitor::ToStdString(
+                    [NSString stringWithFormat:@"Notification permission failed: %@",
+                     error.localizedDescription]
+                );
             }
 
             [self updateMenu];
@@ -171,8 +204,9 @@ static NSTimeInterval const kPollInterval = 300.0;
         NSString *rawValue = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         NSString *trimmedValue = [rawValue stringByTrimmingCharactersInSet:
                                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        std::string ipValue = ipmonitor::ToStdString(trimmedValue);
 
-        if (![self looksLikeIPAddress:trimmedValue]) {
+        if (!ipmonitor::LooksLikeIPAddress(ipValue)) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self recordFailure:[NSString stringWithFormat:@"Unexpected response from ip.me: %@",
                                      trimmedValue]];
@@ -181,51 +215,38 @@ static NSTimeInterval const kPollInterval = 300.0;
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self recordSuccess:trimmedValue notifyOnChange:notifyOnChange];
+            [self recordSuccess:ipValue notifyOnChange:notifyOnChange];
         });
     }] resume];
 }
 
-- (BOOL)looksLikeIPAddress:(NSString *)value {
-    NSError *error = nil;
-    NSRegularExpression *regex = [NSRegularExpression
-        regularExpressionWithPattern:@"^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f:]+)$"
-                             options:0
-                               error:&error];
+- (void)recordSuccess:(const std::string &)ip notifyOnChange:(BOOL)notifyOnChange {
+    std::optional<std::string> previousIP = self.monitorState.currentIP;
 
-    if (regex == nil || error != nil) {
-        return NO;
-    }
-
-    NSRange fullRange = NSMakeRange(0, value.length);
-    return [regex firstMatchInString:value options:0 range:fullRange] != nil;
-}
-
-- (void)recordSuccess:(NSString *)ip notifyOnChange:(BOOL)notifyOnChange {
-    NSString *previousIP = self.currentIP;
-
-    self.currentIP = ip;
+    self.monitorState.currentIP = ip;
+    self.monitorState.lastError.reset();
     self.lastCheckedAt = [NSDate date];
-    self.lastError = nil;
 
-    [[NSUserDefaults standardUserDefaults] setObject:ip forKey:kLastKnownIPKey];
+    [[NSUserDefaults standardUserDefaults] setObject:ipmonitor::ToNSString(ip)
+                                              forKey:ipmonitor::kLastKnownIPKey];
 
-    if (previousIP != nil && ![previousIP isEqualToString:ip] && notifyOnChange) {
-        [self sendNotificationFromIP:previousIP toIP:ip];
+    if (previousIP.has_value() && previousIP.value() != ip && notifyOnChange) {
+        [self sendNotificationFromIP:previousIP.value() toIP:ip];
     }
 
     [self updateMenu];
 }
 
 - (void)recordFailure:(NSString *)message {
+    self.monitorState.lastError = ipmonitor::ToStdString(message);
     self.lastCheckedAt = [NSDate date];
-    self.lastError = message;
     [self updateMenu];
 }
 
 - (void)updateMenu {
-    if (self.currentIP != nil) {
-        self.currentIPMenuItem.title = [NSString stringWithFormat:@"Current IP: %@", self.currentIP];
+    if (self.monitorState.currentIP.has_value()) {
+        self.currentIPMenuItem.title = [NSString stringWithFormat:@"Current IP: %@",
+                                        ipmonitor::ToNSString(self.monitorState.currentIP.value())];
     } else {
         self.currentIPMenuItem.title = @"Current IP: Unknown";
     }
@@ -241,11 +262,12 @@ static NSTimeInterval const kPollInterval = 300.0;
         self.lastCheckedMenuItem.title = @"Last checked: Never";
     }
 
-    if (self.lastError != nil) {
-        self.statusMenuItem.title = [NSString stringWithFormat:@"Status: %@", self.lastError];
+    if (self.monitorState.lastError.has_value()) {
+        self.statusMenuItem.title = [NSString stringWithFormat:@"Status: %@",
+                                     ipmonitor::ToNSString(self.monitorState.lastError.value())];
     } else {
         self.statusMenuItem.title = [NSString stringWithFormat:@"Status: Monitoring every %d seconds",
-                                     (int)kPollInterval];
+                                     (int)ipmonitor::kPollInterval];
     }
 
     self.notificationsMenuItem.title = self.notificationsAuthorized
@@ -253,14 +275,16 @@ static NSTimeInterval const kPollInterval = 300.0;
         : @"Notifications: Not enabled";
 }
 
-- (void)sendNotificationFromIP:(NSString *)oldIP toIP:(NSString *)newIP {
+- (void)sendNotificationFromIP:(const std::string &)oldIP toIP:(const std::string &)newIP {
     if (!self.notificationsAuthorized) {
         return;
     }
 
     UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
     content.title = @"Public IP Changed";
-    content.body = [NSString stringWithFormat:@"Old: %@\nNew: %@", oldIP, newIP];
+    content.body = [NSString stringWithFormat:@"Old: %@\nNew: %@",
+                    ipmonitor::ToNSString(oldIP),
+                    ipmonitor::ToNSString(newIP)];
     content.sound = [UNNotificationSound defaultSound];
 
     NSString *identifier = [[NSUUID UUID] UUIDString];
